@@ -57,8 +57,18 @@ void Error_Handler(void);
 /* USER CODE END EFP */
 
 /* Private defines -----------------------------------------------------------*/
+#define EMERGENCY_Pin GPIO_PIN_7
+#define EMERGENCY_GPIO_Port GPIOC
+#define INERTIA_Pin GPIO_PIN_8
+#define INERTIA_GPIO_Port GPIOC
+#define IGN_Pin GPIO_PIN_9
+#define IGN_GPIO_Port GPIOC
+#define R2D_Pin GPIO_PIN_8
+#define R2D_GPIO_Port GPIOA
 #define HEARTBEAT_Pin GPIO_PIN_11
 #define HEARTBEAT_GPIO_Port GPIOC
+#define TS_ON_LED_Pin GPIO_PIN_2
+#define TS_ON_LED_GPIO_Port GPIOD
 
 /* USER CODE BEGIN Private defines */
 
