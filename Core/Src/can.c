@@ -297,9 +297,49 @@ static CAN_BusStatus *CAN_GetStatus(CAN_HandleTypeDef *hcan)
   return (hcan == &hcan1) ? &can1_status : &can2_status;
 }
 
+// Meaning and usual causes, shown in Live Expressions (state_text, last_error_text) and on UART
+static const char *const CAN_StateText[] = {
+  [CAN_STATE_OK]          = "OK - error active, bus healthy",
+  [CAN_STATE_WARNING]     = "WARNING - TEC or REC >= 96: errors happening, still communicating",
+  [CAN_STATE_PASSIVE]     = "PASSIVE - TEC or REC >= 128: many errors (REC high = receive side, TEC high = our TX side)",
+  [CAN_STATE_BUS_OFF]     = "BUS-OFF - TEC > 255: not sending, hardware recovers after 128 x 11 recessive bits",
+  [CAN_STATE_NOT_STARTED] = "NOT STARTED - controller off: start timed out (bus stuck dominant, transceiver unpowered), restarting",
+};
+
+static const char *const CAN_ErrorText[] = {
+  [CAN_ERR_NONE]          = "none",
+  [CAN_ERR_STUFF]         = "STUFF - 6 equal bits: node at another bitrate, noise, missing 120R termination",
+  [CAN_ERR_FORM]          = "FORM - fixed bit field wrong: bitrate or sample point mismatch, noise",
+  [CAN_ERR_ACK]           = "ACK - nobody acknowledged our frame: no other node powered/connected, CANH/CANL open or swapped, other bitrate",
+  [CAN_ERR_BIT_RECESSIVE] = "BIT RECESSIVE - sent 1 read 0: bus held dominant or shorted, faulty node/transceiver",
+  [CAN_ERR_BIT_DOMINANT]  = "BIT DOMINANT - sent 0 read 1: our TX not reaching the bus (transceiver off/standby, TX wiring)",
+  [CAN_ERR_CRC]           = "CRC - corrupted frame: noise, bad termination or long stubs, bitrate mismatch",
+};
+
+#define CAN_RESTART_MS  100   // Min time between restarts, a failing start blocks up to 10 ms
+#define CAN_PRINT_MS    1000  // UART report rate limit
+
+// Per bus bookkeeping for CAN_Service
+typedef struct {
+  uint32_t last_restart_ms;
+  uint32_t last_print_ms;
+  CAN_BusState printed_state;
+  CAN_ErrorCode printed_error;
+} CAN_ServiceData;
+
+static CAN_ServiceData can_service[2];
+
 // Filters, start and notifications. Used at boot and after every restart.
 HAL_StatusTypeDef CAN_Config(CAN_HandleTypeDef *hcan)
 {
+  CAN_BusStatus *status = CAN_GetStatus(hcan);
+
+  // Readable texts from boot, before the first CAN_Service
+  status->state_text = CAN_StateText[status->state];
+  if (status->last_error_text == NULL) {
+    status->last_error_text = CAN_ErrorText[CAN_ERR_NONE];
+  }
+
   if (hcan == &hcan1) {
     CAN_FilterConfig1();
   } else {
@@ -373,160 +413,123 @@ HAL_StatusTypeDef CAN_Send(CAN_HandleTypeDef *hcan, CAN_TxHeaderTypeDef *header,
   return HAL_OK;
 }
 
-// Call every 10 ms for each bus. Every 100 ms it reads the bus state, reports errors on
-// UART (only when they change) and restarts the controller if it is not running.
-// Bus-off itself is recovered by hardware (AutoBusOff = ENABLE).
+// Call every 10 ms for each bus. Reads the bus state and every error flag into canX_status,
+// reports changes on UART (max once per second) and restarts the controller if it is not
+// running (max every 100 ms). Bus-off itself is recovered by hardware (AutoBusOff = ENABLE).
 void CAN_Service(CAN_HandleTypeDef *hcan)
 {
-  static uint32_t last_can1_check = 0;
-  static uint32_t last_can2_check = 0;
-
-  uint32_t now = HAL_GetTick();
-  uint32_t *last_check;
   int bus;
 
   if (hcan == &hcan1) {
-    last_check = &last_can1_check;
     bus = 1;
   } else if (hcan == &hcan2) {
-    last_check = &last_can2_check;
     bus = 2;
   } else {
     return;
   }
 
-  // Only check every 100 ms
-  if ((now - *last_check) < 100) {
-    return;
-  }
-  *last_check = now;
-
+  CAN_TypeDef *can = hcan->Instance;
   CAN_BusStatus *status = CAN_GetStatus(hcan);
-  uint32_t esr = hcan->Instance->ESR;
-  uint32_t error = HAL_CAN_GetError(hcan);
+  CAN_ServiceData *svc = &can_service[bus - 1];
+  CAN_BusState prev_state = status->state;
+  uint32_t now = HAL_GetTick();
+  uint32_t esr = can->ESR;
+  uint32_t tsr = can->TSR;
+  CAN_ErrorCode lec = (CAN_ErrorCode)((esr & CAN_ESR_LEC) >> CAN_ESR_LEC_Pos);
 
-  // Error interrupts are not enabled, so take the bus state straight from ESR
-  if (esr & CAN_ESR_EWGF) {
-    error |= HAL_CAN_ERROR_EWG;
-  }
-  if (esr & CAN_ESR_EPVF) {
-    error |= HAL_CAN_ERROR_EPV;
-  }
-  if (esr & CAN_ESR_BOFF) {
-    error |= HAL_CAN_ERROR_BOF;
-  }
-  switch ((esr & CAN_ESR_LEC) >> CAN_ESR_LEC_Pos) {
-    case 1: error |= HAL_CAN_ERROR_STF; break;
-    case 2: error |= HAL_CAN_ERROR_FOR; break;
-    case 3: error |= HAL_CAN_ERROR_ACK; break;
-    case 4: error |= HAL_CAN_ERROR_BR;  break;
-    case 5: error |= HAL_CAN_ERROR_BD;  break;
-    case 6: error |= HAL_CAN_ERROR_CRC; break;
-    default: break;
-  }
-  // Clear the last error code so the next check only sees new errors
-  CLEAR_BIT(hcan->Instance->ESR, CAN_ESR_LEC);
+  // Error interrupts are not enabled, so every flag is collected by polling the registers.
+  // HAL error code first: start/init timeouts, no free TX mailbox (param)...
+  CAN_HalError error = { .raw = HAL_CAN_GetError(hcan) };
 
+  // Error counters and state flags
   status->tec = (uint8_t)((esr & CAN_ESR_TEC) >> CAN_ESR_TEC_Pos);
   status->rec = (uint8_t)((esr & CAN_ESR_REC) >> CAN_ESR_REC_Pos);
-
-  if (error == HAL_CAN_ERROR_NONE) {
-    if (status->fault) {
-      printf("CAN%d OK\r\n", bus);
-    }
-    status->fault = 0;
-    status->last_error = HAL_CAN_ERROR_NONE;
-    return;
+  if (esr & CAN_ESR_EWGF) {
+    error.bit.ewg = 1;
+  }
+  if (esr & CAN_ESR_EPVF) {
+    error.bit.epv = 1;
+  }
+  if (esr & CAN_ESR_BOFF) {
+    error.bit.bof = 1;
   }
 
-  // Report only when the error changes, so the UART is not flooded
-  if (!status->fault || (error != status->last_error)) {
-    printf("CAN%d TEC=%u REC=%u ", bus, status->tec, status->rec);
-    CAN_PrintHalError(error);
+  // Last protocol error since the previous check, then clear it so the next check only sees new ones
+  switch (lec) {
+    case CAN_ERR_STUFF:         error.bit.stuff = 1;         status->errors.stuff++;         break;
+    case CAN_ERR_FORM:          error.bit.form = 1;          status->errors.form++;          break;
+    case CAN_ERR_ACK:           error.bit.ack = 1;           status->errors.ack++;           break;
+    case CAN_ERR_BIT_RECESSIVE: error.bit.bit_recessive = 1; status->errors.bit_recessive++; break;
+    case CAN_ERR_BIT_DOMINANT:  error.bit.bit_dominant = 1;  status->errors.bit_dominant++;  break;
+    case CAN_ERR_CRC:           error.bit.crc = 1;           status->errors.crc++;           break;
+    default: break;
   }
-  status->fault = 1;
-  status->last_error = error;
+  if ((lec >= CAN_ERR_STUFF) && (lec <= CAN_ERR_CRC)) {
+    status->last_error = lec;
+    status->last_error_text = CAN_ErrorText[lec];
+    status->last_error_ms = now;
+  }
+  CLEAR_BIT(can->ESR, CAN_ESR_LEC);
+
+  // Why finished TX requests failed (a frame replaced by a newer value ends as aborted),
+  // then clear the request-completed flags (write 1)
+  if ((tsr & CAN_TSR_RQCP0) && (tsr & CAN_TSR_ALST0)) { error.bit.tx_arb_lost_mb0 = 1; status->errors.tx_arb_lost++; }
+  if ((tsr & CAN_TSR_RQCP0) && (tsr & CAN_TSR_TERR0)) { error.bit.tx_error_mb0 = 1;    status->errors.tx_error++; }
+  if ((tsr & CAN_TSR_RQCP1) && (tsr & CAN_TSR_ALST1)) { error.bit.tx_arb_lost_mb1 = 1; status->errors.tx_arb_lost++; }
+  if ((tsr & CAN_TSR_RQCP1) && (tsr & CAN_TSR_TERR1)) { error.bit.tx_error_mb1 = 1;    status->errors.tx_error++; }
+  if ((tsr & CAN_TSR_RQCP2) && (tsr & CAN_TSR_ALST2)) { error.bit.tx_arb_lost_mb2 = 1; status->errors.tx_arb_lost++; }
+  if ((tsr & CAN_TSR_RQCP2) && (tsr & CAN_TSR_TERR2)) { error.bit.tx_error_mb2 = 1;    status->errors.tx_error++; }
+  can->TSR = tsr & (CAN_TSR_RQCP0 | CAN_TSR_RQCP1 | CAN_TSR_RQCP2);
+
+  // Bus state, worst first
+  if (HAL_CAN_GetState(hcan) != HAL_CAN_STATE_LISTENING) {
+    status->state = CAN_STATE_NOT_STARTED;
+    error.bit.not_started = 1;
+  } else if (esr & CAN_ESR_BOFF) {
+    status->state = CAN_STATE_BUS_OFF;
+  } else if (esr & CAN_ESR_EPVF) {
+    status->state = CAN_STATE_PASSIVE;
+  } else if (esr & CAN_ESR_EWGF) {
+    status->state = CAN_STATE_WARNING;
+  } else {
+    status->state = CAN_STATE_OK;
+  }
+  status->state_text = CAN_StateText[status->state];
+  if ((status->state == CAN_STATE_BUS_OFF) && (prev_state != CAN_STATE_BUS_OFF)) {
+    status->errors.bus_off++;
+  }
+
+  // Error flags: last non-empty set and everything seen since boot
+  if (error.raw != 0U) {
+    status->error_last = error;
+    status->error_seen.raw |= error.raw;
+  }
+  if ((error.raw != 0U) && !status->fault) {
+    status->fault_count++;
+  }
+  status->fault = (error.raw != 0U) ? 1 : 0;
+
+  // UART report when the state or the last error changes, max once per second
+  if (((status->state != svc->printed_state) || (status->last_error != svc->printed_error)) &&
+      ((now - svc->last_print_ms) >= CAN_PRINT_MS)) {
+    svc->last_print_ms = now;
+    svc->printed_state = status->state;
+    svc->printed_error = status->last_error;
+    printf("CAN%d %s | TEC=%u REC=%u | last error: %s\r\n",
+           bus, status->state_text, status->tec, status->rec, status->last_error_text);
+  }
 
   // Controller not running (start timeout, stopped, error state): restart it in place.
-  // If it fails again, the next check sees the new error code and retries in 100 ms.
-  if (HAL_CAN_GetState(hcan) != HAL_CAN_STATE_LISTENING) {
-    status->restarts++;
-    CAN_Restart(hcan);
+  // HAL_CAN_Init clears the HAL error code; if it fails again the next restart is in 100 ms.
+  if (status->state == CAN_STATE_NOT_STARTED) {
+    if ((now - svc->last_restart_ms) >= CAN_RESTART_MS) {
+      svc->last_restart_ms = now;
+      status->restarts++;
+      CAN_Restart(hcan);
+    }
     return;
   }
 
   HAL_CAN_ResetError(hcan);
-}
-
-void CAN_PrintHalError(uint32_t error)
-{
-  printf("HAL_CAN error = 0x%08lX\r\n", error);
-
-  if (error & HAL_CAN_ERROR_EWG) {
-    printf(" - HAL_CAN_ERROR_EWG: error warning\r\n");
-  }
-  if (error & HAL_CAN_ERROR_EPV) {
-    printf(" - HAL_CAN_ERROR_EPV: error passive\r\n");
-  }
-  if (error & HAL_CAN_ERROR_BOF) {
-    printf(" - HAL_CAN_ERROR_BOF: bus off\r\n");
-  }
-  if (error & HAL_CAN_ERROR_STF) {
-    printf(" - HAL_CAN_ERROR_STF: stuff error\r\n");
-  }
-  if (error & HAL_CAN_ERROR_FOR) {
-    printf(" - HAL_CAN_ERROR_FOR: form error\r\n");
-  }
-  if (error & HAL_CAN_ERROR_ACK) {
-    printf(" - HAL_CAN_ERROR_ACK: no ACK received\r\n");
-  }
-  if (error & HAL_CAN_ERROR_BR) {
-    printf(" - HAL_CAN_ERROR_BR: bit recessive error\r\n");
-  }
-  if (error & HAL_CAN_ERROR_BD) {
-    printf(" - HAL_CAN_ERROR_BD: bit dominant error\r\n");
-  }
-  if (error & HAL_CAN_ERROR_CRC) {
-    printf(" - HAL_CAN_ERROR_CRC: CRC error\r\n");
-  }
-  if (error & HAL_CAN_ERROR_RX_FOV0) {
-    printf(" - HAL_CAN_ERROR_RX_FOV0: RX FIFO0 overrun\r\n");
-  }
-  if (error & HAL_CAN_ERROR_RX_FOV1) {
-    printf(" - HAL_CAN_ERROR_RX_FOV1: RX FIFO1 overrun\r\n");
-  }
-  if (error & HAL_CAN_ERROR_TX_ALST0) {
-    printf(" - HAL_CAN_ERROR_TX_ALST0: arbitration lost mailbox 0\r\n");
-  }
-  if (error & HAL_CAN_ERROR_TX_TERR0) {
-    printf(" - HAL_CAN_ERROR_TX_TERR0: transmit error mailbox 0\r\n");
-  }
-  if (error & HAL_CAN_ERROR_TX_ALST1) {
-    printf(" - HAL_CAN_ERROR_TX_ALST1: arbitration lost mailbox 1\r\n");
-  }
-  if (error & HAL_CAN_ERROR_TX_TERR1) {
-    printf(" - HAL_CAN_ERROR_TX_TERR1: transmit error mailbox 1\r\n");
-  }
-  if (error & HAL_CAN_ERROR_TX_ALST2) {
-    printf(" - HAL_CAN_ERROR_TX_ALST2: arbitration lost mailbox 2\r\n");
-  }
-  if (error & HAL_CAN_ERROR_TX_TERR2) {
-    printf(" - HAL_CAN_ERROR_TX_TERR2: transmit error mailbox 2\r\n");
-  }
-  if (error & HAL_CAN_ERROR_TIMEOUT) {
-    printf(" - HAL_CAN_ERROR_TIMEOUT\r\n");
-  }
-  if (error & HAL_CAN_ERROR_NOT_INITIALIZED) {
-    printf(" - HAL_CAN_ERROR_NOT_INITIALIZED\r\n");
-  }
-  if (error & HAL_CAN_ERROR_NOT_READY) {
-    printf(" - HAL_CAN_ERROR_NOT_READY\r\n");
-  }
-  if (error & HAL_CAN_ERROR_NOT_STARTED) {
-    printf(" - HAL_CAN_ERROR_NOT_STARTED\r\n");
-  }
-  if (error & HAL_CAN_ERROR_PARAM) {
-    printf(" - HAL_CAN_ERROR_PARAM: no free TX mailbox\r\n");
-  }
 }
 /* USER CODE END 1 */

@@ -59,9 +59,11 @@ uint8_t emergency;  // PC7
 
 // Analog sensors
 float ST_ANGLE;     // Steering angle (deg)
-float SUSP1;        // Left suspension position (mm)
-float SUSP2;        // Right suspension position (mm)
-uint16_t adcSusp1, adcSusp2;
+float SUSP1;        // Left suspension travel from ride height (mm): + extension, - compression
+float SUSP2;        // Right suspension travel from ride height (mm): + extension, - compression
+float SUSP_LEFT_ZERO;           // Absolute left position at boot = ride height (mm)
+float SUSP_RIGHT_ZERO;          // Absolute right position at boot = ride height (mm)
+uint8_t susp_zero_valid = 0;    // 1 once the ride height zero was captured
 uint16_t adcSt_Angle;
 uint16_t ADC_VALUE[3];  // DMA target: [0] PA7 steering, [1] PB0 susp1, [2] PB1 susp2
 
@@ -100,8 +102,10 @@ typedef struct {
 
 	struct {
 		float steering_deg;
-		float susp_left_mm;
+		float susp_left_mm;     // travel from ride height: + extension, - compression
 		float susp_right_mm;
+		float susp_left_zero_mm;  // absolute position captured at boot
+		float susp_right_zero_mm;
 	} sensors;
 
 	struct {
@@ -305,8 +309,6 @@ void execute_10ms_tasks() {
 
 	// Latest filtered ADC samples
 	adcSt_Angle = adc_filtered[0];
-	adcSusp1 = adc_filtered[1];
-	adcSusp2 = adc_filtered[2];
 
 	// Digital inputs
 	ignition = HAL_GPIO_ReadPin(IGN_GPIO_Port, IGN_Pin);
@@ -314,7 +316,7 @@ void execute_10ms_tasks() {
 	inertia = HAL_GPIO_ReadPin(INERTIA_GPIO_Port, INERTIA_Pin);
 	emergency = HAL_GPIO_ReadPin(EMERGENCY_GPIO_Port, EMERGENCY_Pin);
 
-	// CAN health check / recovery (runs every 100 ms internally)
+	// CAN health check every 10 ms, restart max every 100 ms (see canX_status / acq4.can)
 	CAN_Service(&hcan1);
 	CAN_Service(&hcan2);
 
@@ -324,13 +326,29 @@ void execute_10ms_tasks() {
 void execute_50ms_tasks() {
 	ADC_UpdateMovingAverage();
 	ST_ANGLE = MeasureSteeringAngle(adcSt_Angle);
-	SUSP1 = MeasureSuspensionPosition(adcSusp1);
-	SUSP2 = MeasureSuspensionPosition(adcSusp2);
 
-	// Scale by 10 for 1-decimal precision (e.g. 12.3 -> 123)
+	// Ride height zero: wherever the suspension sits at boot becomes 0 mm. Captured the first
+	// time the moving average is full (index wraps back to 0, ~0.5 s after boot); until then send 0.
+	if (!susp_zero_valid && (adc_buffer_index == 0)) {
+		SUSP_LEFT_ZERO = MeasureSuspensionPosition(adc_filtered[1]);
+		SUSP_RIGHT_ZERO = MeasureSuspensionPosition(adc_filtered[2]);
+		susp_zero_valid = 1;
+	}
+
+	// Sign convention: + = EXTENSION, - = COMPRESSION.
+	// On this car the sensor voltage DROPS when the suspension extends, so SUSP = ZERO - absolute.
+	if (susp_zero_valid) {
+		SUSP1 = SUSP_LEFT_ZERO - MeasureSuspensionPosition(adc_filtered[1]);
+		SUSP2 = SUSP_RIGHT_ZERO - MeasureSuspensionPosition(adc_filtered[2]);
+	} else {
+		SUSP1 = 0.0f;
+		SUSP2 = 0.0f;
+	}
+
+	// Scale by 10 for 1-decimal precision (e.g. 12.3 -> 123), signed like the DBC (int16)
 	int16_t st_angle = (int16_t) (ST_ANGLE * 10.0f);
-	uint16_t susp1 = (uint16_t) (SUSP1 * 10.0f);
-	uint16_t susp2 = (uint16_t) (SUSP2 * 10.0f);
+	int16_t susp1 = (int16_t) (SUSP1 * 10.0f);
+	int16_t susp2 = (int16_t) (SUSP2 * 10.0f);
 
 	// CAN1 - 0x740: steering angle, suspensions, inertia/emergency
 	TxHeader.IDE = CAN_ID_STD;
@@ -416,6 +434,8 @@ void Acq4_DebugUpdate(void) {
 	acq4.sensors.steering_deg = ST_ANGLE;
 	acq4.sensors.susp_left_mm = SUSP1;
 	acq4.sensors.susp_right_mm = SUSP2;
+	acq4.sensors.susp_left_zero_mm = SUSP_LEFT_ZERO;
+	acq4.sensors.susp_right_zero_mm = SUSP_RIGHT_ZERO;
 
 	acq4.io.ignition = ignition;
 	acq4.io.r2d = r2d;
