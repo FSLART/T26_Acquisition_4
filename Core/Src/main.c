@@ -30,6 +30,8 @@
 /* USER CODE BEGIN Includes */
 #include <stdio.h>
 #include <string.h>
+#include "../DBC/autonomous_t26.h"
+#include "../DBC/powertrain_t26.h"
 
 /* USER CODE END Includes */
 
@@ -124,7 +126,7 @@ typedef struct {
 	} ams;
 
 	struct {
-		uint8_t tx_740[7];      // last payload queued on CAN1 (0x740)
+		uint8_t tx_740[7];      // last payload queued on CAN1 and CAN2 (0x740)
 		uint8_t tx_060[1];      // last payload queued on CAN2 (0x060)
 		CAN_BusStatus can1;
 		CAN_BusStatus can2;
@@ -345,36 +347,49 @@ void execute_50ms_tasks() {
 		SUSP2 = 0.0f;
 	}
 
-	// Scale by 10 for 1-decimal precision (e.g. 12.3 -> 123), signed like the DBC (int16)
-	int16_t st_angle = (int16_t) (ST_ANGLE * 10.0f);
-	int16_t susp1 = (int16_t) (SUSP1 * 10.0f);
-	int16_t susp2 = (int16_t) (SUSP2 * 10.0f);
+	// Frames are built with the cantools code of each bus DBC (Core/DBC): scale, sign and bit
+	// layout come from the DBC, so a DBC change only needs the files regenerated.
+	// 0x740 AQT4 (steering angle, suspensions, inertia/emergency) goes on both buses.
+	struct autonomous_t26_aqt4_t aqt4_autonomous = {
+		.st_angle = autonomous_t26_aqt4_st_angle_encode(ST_ANGLE),
+		.susp_l = autonomous_t26_aqt4_susp_l_encode(SUSP1),
+		.susp_r = autonomous_t26_aqt4_susp_r_encode(SUSP2),
+		.inertia = autonomous_t26_aqt4_inertia_encode(inertia),
+		.emergency = autonomous_t26_aqt4_emergency_encode(emergency),
+	};
+	struct powertrain_t26_aqt4_t aqt4_powertrain = {
+		.st_angle = powertrain_t26_aqt4_st_angle_encode(ST_ANGLE),
+		.susp_l = powertrain_t26_aqt4_susp_l_encode(SUSP1),
+		.susp_r = powertrain_t26_aqt4_susp_r_encode(SUSP2),
+		.inertia = powertrain_t26_aqt4_inertia_encode(inertia),
+		.emergency = powertrain_t26_aqt4_emergency_encode(emergency),
+	};
+	struct powertrain_t26_dash_board_t dash_board = {
+		.ignition_switch_raw = powertrain_t26_dash_board_ignition_switch_raw_encode(ignition),
+		.r2d_button_raw = powertrain_t26_dash_board_r2d_button_raw_encode(r2d),
+	};
 
-	// CAN1 - 0x740: steering angle, suspensions, inertia/emergency
 	TxHeader.IDE = CAN_ID_STD;
-	TxHeader.StdId = 0x740;
 	TxHeader.RTR = CAN_RTR_DATA;
-	TxHeader.DLC = 7;
 
-	TxData[0] = st_angle & 0xFF;          // Steering angle LSB
-	TxData[1] = (st_angle >> 8) & 0xFF;   // Steering angle MSB
-	TxData[2] = susp1 & 0xFF;             // Suspension 1 LSB
-	TxData[3] = (susp1 >> 8) & 0xFF;      // Suspension 1 MSB
-	TxData[4] = susp2 & 0xFF;             // Suspension 2 LSB
-	TxData[5] = (susp2 >> 8) & 0xFF;      // Suspension 2 MSB
-	TxData[6] = (inertia & 0x01) | ((emergency << 1) & 0x02);
-
-	// A failed send is counted in can1_status and handled by CAN_Service, never fatal
+	// A failed send is counted in canX_status and handled by CAN_Service, never fatal
+	// CAN1 (autonomous) - 0x740 AQT4
+	TxHeader.StdId = AUTONOMOUS_T26_AQT4_FRAME_ID;
+	TxHeader.DLC = AUTONOMOUS_T26_AQT4_LENGTH;
+	autonomous_t26_aqt4_pack(TxData, &aqt4_autonomous, sizeof(TxData));
 	memcpy(acq4.can.tx_740, TxData, sizeof(acq4.can.tx_740));
 	CAN_Send(&hcan1, &TxHeader, TxData);
 
-	// CAN2 - 0x060: ignition / R2D
-	TxHeader.IDE = CAN_ID_STD;
-	TxHeader.StdId = 0x60;
-	TxHeader.RTR = CAN_RTR_DATA;
-	TxHeader.DLC = 1;
+	// CAN2 (powertrain) - 0x740 AQT4
+	TxHeader.StdId = POWERTRAIN_T26_AQT4_FRAME_ID;
+	TxHeader.DLC = POWERTRAIN_T26_AQT4_LENGTH;
+	powertrain_t26_aqt4_pack(TxData, &aqt4_powertrain, sizeof(TxData));
+	CAN_Send(&hcan2, &TxHeader, TxData);
 
-	TxData[0] = (ignition & 0x01) | ((r2d << 1) & 0x02);
+	// CAN2 (powertrain) - 0x060 DashBoard: ignition / R2D
+	TxHeader.StdId = POWERTRAIN_T26_DASH_BOARD_FRAME_ID;
+	TxHeader.DLC = POWERTRAIN_T26_DASH_BOARD_LENGTH;
+	powertrain_t26_dash_board_pack(TxData, &dash_board, sizeof(TxData));
 	memcpy(acq4.can.tx_060, TxData, sizeof(acq4.can.tx_060));
 	CAN_Send(&hcan2, &TxHeader, TxData);
 }
