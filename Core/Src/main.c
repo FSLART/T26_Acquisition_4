@@ -126,7 +126,7 @@ typedef struct {
 	} ams;
 
 	struct {
-		uint8_t tx_740[7];      // last payload queued on CAN1 and CAN2 (0x740)
+		uint8_t tx_740[7];      // last AQT4 payload queued (CAN1 0x740, same bytes on CAN2 0x070)
 		uint8_t tx_060[1];      // last payload queued on CAN2 (0x060)
 		CAN_BusStatus can1;
 		CAN_BusStatus can2;
@@ -349,7 +349,7 @@ void execute_50ms_tasks() {
 
 	// Frames are built with the cantools code of each bus DBC (Core/DBC): scale, sign and bit
 	// layout come from the DBC, so a DBC change only needs the files regenerated.
-	// 0x740 AQT4 (steering angle, suspensions, inertia/emergency) goes on both buses.
+	// AQT4 (steering angle, suspensions, inertia/emergency) goes on both buses, ID from each DBC.
 	struct autonomous_t26_aqt4_t aqt4_autonomous = {
 		.st_angle = autonomous_t26_aqt4_st_angle_encode(ST_ANGLE),
 		.susp_l = autonomous_t26_aqt4_susp_l_encode(SUSP1),
@@ -373,14 +373,14 @@ void execute_50ms_tasks() {
 	TxHeader.RTR = CAN_RTR_DATA;
 
 	// A failed send is counted in canX_status and handled by CAN_Service, never fatal
-	// CAN1 (autonomous) - 0x740 AQT4
+	// CAN1 (autonomous) - AQT4 0x740
 	TxHeader.StdId = AUTONOMOUS_T26_AQT4_FRAME_ID;
 	TxHeader.DLC = AUTONOMOUS_T26_AQT4_LENGTH;
 	autonomous_t26_aqt4_pack(TxData, &aqt4_autonomous, sizeof(TxData));
 	memcpy(acq4.can.tx_740, TxData, sizeof(acq4.can.tx_740));
 	CAN_Send(&hcan1, &TxHeader, TxData);
 
-	// CAN2 (powertrain) - 0x740 AQT4
+	// CAN2 (powertrain) - AQT4 0x070
 	TxHeader.StdId = POWERTRAIN_T26_AQT4_FRAME_ID;
 	TxHeader.DLC = POWERTRAIN_T26_AQT4_LENGTH;
 	powertrain_t26_aqt4_pack(TxData, &aqt4_powertrain, sizeof(TxData));
