@@ -39,13 +39,13 @@ Idx Name          Size      VMA       LMA       File off  Algn
                   CONTENTS, READONLY, DEBUGGING, OCTETS
  17 .debug_line   000426b6  00000000  00000000  0008cbe3  2**0
                   CONTENTS, READONLY, DEBUGGING, OCTETS
- 18 .debug_str    00133205  00000000  00000000  000cf299  2**0
+ 18 .debug_str    00133204  00000000  00000000  000cf299  2**0
                   CONTENTS, READONLY, DEBUGGING, OCTETS
- 19 .comment      00000043  00000000  00000000  0020249e  2**0
+ 19 .comment      00000043  00000000  00000000  0020249d  2**0
                   CONTENTS, READONLY
- 20 .debug_frame  00029a7c  00000000  00000000  002024e4  2**2
+ 20 .debug_frame  00029a7c  00000000  00000000  002024e0  2**2
                   CONTENTS, READONLY, DEBUGGING, OCTETS
- 21 .debug_line_str 00000060  00000000  00000000  0022bf60  2**0
+ 21 .debug_line_str 00000060  00000000  00000000  0022bf5c  2**0
                   CONTENTS, READONLY, DEBUGGING, OCTETS
 
 Disassembly of section .text:
@@ -4922,7 +4922,7 @@ void execute_50ms_tasks() {
 
 	// Frames are built with the cantools code of each bus DBC (Core/DBC): scale, sign and bit
 	// layout come from the DBC, so a DBC change only needs the files regenerated.
-	// 0x740 AQT4 (steering angle, suspensions, inertia/emergency) goes on both buses.
+	// AQT4 (steering angle, suspensions, inertia/emergency) goes on both buses, ID from each DBC.
 	struct autonomous_t26_aqt4_t aqt4_autonomous = {
 		.st_angle = autonomous_t26_aqt4_st_angle_encode(ST_ANGLE),
  80026ca:	4b78      	ldr	r3, [pc, #480]	@ (80028ac <execute_50ms_tasks+0x298>)
@@ -5084,7 +5084,7 @@ void execute_50ms_tasks() {
  800280c:	60da      	str	r2, [r3, #12]
 
 	// A failed send is counted in canX_status and handled by CAN_Service, never fatal
-	// CAN1 (autonomous) - 0x740 AQT4
+	// CAN1 (autonomous) - AQT4 0x740
 	TxHeader.StdId = AUTONOMOUS_T26_AQT4_FRAME_ID;
  800280e:	4b33      	ldr	r3, [pc, #204]	@ (80028dc <execute_50ms_tasks+0x2c8>)
  8002810:	f44f 62e8 	mov.w	r2, #1856	@ 0x740
@@ -5116,58 +5116,59 @@ void execute_50ms_tasks() {
  8002844:	4828      	ldr	r0, [pc, #160]	@ (80028e8 <execute_50ms_tasks+0x2d4>)
  8002846:	f7ff fa35 	bl	8001cb4 <CAN_Send>
 
-	// CAN2 (powertrain) - 0x740 AQT4
+	// CAN2 (powertrain) - AQT4 0x070
 	TxHeader.StdId = POWERTRAIN_T26_AQT4_FRAME_ID;
  800284a:	4b24      	ldr	r3, [pc, #144]	@ (80028dc <execute_50ms_tasks+0x2c8>)
- 800284c:	f44f 62e8 	mov.w	r2, #1856	@ 0x740
- 8002850:	601a      	str	r2, [r3, #0]
+ 800284c:	2270      	movs	r2, #112	@ 0x70
+ 800284e:	601a      	str	r2, [r3, #0]
 	TxHeader.DLC = POWERTRAIN_T26_AQT4_LENGTH;
- 8002852:	4b22      	ldr	r3, [pc, #136]	@ (80028dc <execute_50ms_tasks+0x2c8>)
- 8002854:	2207      	movs	r2, #7
- 8002856:	611a      	str	r2, [r3, #16]
+ 8002850:	4b22      	ldr	r3, [pc, #136]	@ (80028dc <execute_50ms_tasks+0x2c8>)
+ 8002852:	2207      	movs	r2, #7
+ 8002854:	611a      	str	r2, [r3, #16]
 	powertrain_t26_aqt4_pack(TxData, &aqt4_powertrain, sizeof(TxData));
- 8002858:	f107 0308 	add.w	r3, r7, #8
- 800285c:	2208      	movs	r2, #8
- 800285e:	4619      	mov	r1, r3
- 8002860:	481f      	ldr	r0, [pc, #124]	@ (80028e0 <execute_50ms_tasks+0x2cc>)
- 8002862:	f7fe fdca 	bl	80013fa <powertrain_t26_aqt4_pack>
+ 8002856:	f107 0308 	add.w	r3, r7, #8
+ 800285a:	2208      	movs	r2, #8
+ 800285c:	4619      	mov	r1, r3
+ 800285e:	4820      	ldr	r0, [pc, #128]	@ (80028e0 <execute_50ms_tasks+0x2cc>)
+ 8002860:	f7fe fdcb 	bl	80013fa <powertrain_t26_aqt4_pack>
 	CAN_Send(&hcan2, &TxHeader, TxData);
- 8002866:	4a1e      	ldr	r2, [pc, #120]	@ (80028e0 <execute_50ms_tasks+0x2cc>)
- 8002868:	491c      	ldr	r1, [pc, #112]	@ (80028dc <execute_50ms_tasks+0x2c8>)
- 800286a:	4820      	ldr	r0, [pc, #128]	@ (80028ec <execute_50ms_tasks+0x2d8>)
- 800286c:	f7ff fa22 	bl	8001cb4 <CAN_Send>
+ 8002864:	4a1e      	ldr	r2, [pc, #120]	@ (80028e0 <execute_50ms_tasks+0x2cc>)
+ 8002866:	491d      	ldr	r1, [pc, #116]	@ (80028dc <execute_50ms_tasks+0x2c8>)
+ 8002868:	4820      	ldr	r0, [pc, #128]	@ (80028ec <execute_50ms_tasks+0x2d8>)
+ 800286a:	f7ff fa23 	bl	8001cb4 <CAN_Send>
 
 	// CAN2 (powertrain) - 0x060 DashBoard: ignition / R2D
 	TxHeader.StdId = POWERTRAIN_T26_DASH_BOARD_FRAME_ID;
- 8002870:	4b1a      	ldr	r3, [pc, #104]	@ (80028dc <execute_50ms_tasks+0x2c8>)
- 8002872:	2260      	movs	r2, #96	@ 0x60
- 8002874:	601a      	str	r2, [r3, #0]
+ 800286e:	4b1b      	ldr	r3, [pc, #108]	@ (80028dc <execute_50ms_tasks+0x2c8>)
+ 8002870:	2260      	movs	r2, #96	@ 0x60
+ 8002872:	601a      	str	r2, [r3, #0]
 	TxHeader.DLC = POWERTRAIN_T26_DASH_BOARD_LENGTH;
- 8002876:	4b19      	ldr	r3, [pc, #100]	@ (80028dc <execute_50ms_tasks+0x2c8>)
- 8002878:	2201      	movs	r2, #1
- 800287a:	611a      	str	r2, [r3, #16]
+ 8002874:	4b19      	ldr	r3, [pc, #100]	@ (80028dc <execute_50ms_tasks+0x2c8>)
+ 8002876:	2201      	movs	r2, #1
+ 8002878:	611a      	str	r2, [r3, #16]
 	powertrain_t26_dash_board_pack(TxData, &dash_board, sizeof(TxData));
- 800287c:	1d3b      	adds	r3, r7, #4
- 800287e:	2208      	movs	r2, #8
- 8002880:	4619      	mov	r1, r3
- 8002882:	4817      	ldr	r0, [pc, #92]	@ (80028e0 <execute_50ms_tasks+0x2cc>)
- 8002884:	f7fe fd65 	bl	8001352 <powertrain_t26_dash_board_pack>
+ 800287a:	1d3b      	adds	r3, r7, #4
+ 800287c:	2208      	movs	r2, #8
+ 800287e:	4619      	mov	r1, r3
+ 8002880:	4817      	ldr	r0, [pc, #92]	@ (80028e0 <execute_50ms_tasks+0x2cc>)
+ 8002882:	f7fe fd66 	bl	8001352 <powertrain_t26_dash_board_pack>
 	memcpy(acq4.can.tx_060, TxData, sizeof(acq4.can.tx_060));
- 8002888:	4b15      	ldr	r3, [pc, #84]	@ (80028e0 <execute_50ms_tasks+0x2cc>)
- 800288a:	781a      	ldrb	r2, [r3, #0]
- 800288c:	4b15      	ldr	r3, [pc, #84]	@ (80028e4 <execute_50ms_tasks+0x2d0>)
- 800288e:	f883 204b 	strb.w	r2, [r3, #75]	@ 0x4b
+ 8002886:	4b16      	ldr	r3, [pc, #88]	@ (80028e0 <execute_50ms_tasks+0x2cc>)
+ 8002888:	781a      	ldrb	r2, [r3, #0]
+ 800288a:	4b16      	ldr	r3, [pc, #88]	@ (80028e4 <execute_50ms_tasks+0x2d0>)
+ 800288c:	f883 204b 	strb.w	r2, [r3, #75]	@ 0x4b
 	CAN_Send(&hcan2, &TxHeader, TxData);
- 8002892:	4a13      	ldr	r2, [pc, #76]	@ (80028e0 <execute_50ms_tasks+0x2cc>)
- 8002894:	4911      	ldr	r1, [pc, #68]	@ (80028dc <execute_50ms_tasks+0x2c8>)
- 8002896:	4815      	ldr	r0, [pc, #84]	@ (80028ec <execute_50ms_tasks+0x2d8>)
- 8002898:	f7ff fa0c 	bl	8001cb4 <CAN_Send>
+ 8002890:	4a13      	ldr	r2, [pc, #76]	@ (80028e0 <execute_50ms_tasks+0x2cc>)
+ 8002892:	4912      	ldr	r1, [pc, #72]	@ (80028dc <execute_50ms_tasks+0x2c8>)
+ 8002894:	4815      	ldr	r0, [pc, #84]	@ (80028ec <execute_50ms_tasks+0x2d8>)
+ 8002896:	f7ff fa0d 	bl	8001cb4 <CAN_Send>
 }
- 800289c:	bf00      	nop
- 800289e:	3718      	adds	r7, #24
- 80028a0:	46bd      	mov	sp, r7
- 80028a2:	ecbd 8b02 	vpop	{d8}
- 80028a6:	bd80      	pop	{r7, pc}
+ 800289a:	bf00      	nop
+ 800289c:	3718      	adds	r7, #24
+ 800289e:	46bd      	mov	sp, r7
+ 80028a0:	ecbd 8b02 	vpop	{d8}
+ 80028a4:	bd80      	pop	{r7, pc}
+ 80028a6:	bf00      	nop
  80028a8:	200003de 	.word	0x200003de
  80028ac:	200003c8 	.word	0x200003c8
  80028b0:	200003dc 	.word	0x200003dc
