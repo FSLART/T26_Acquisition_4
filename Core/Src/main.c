@@ -66,7 +66,6 @@ float SUSP2;        // Right suspension travel from ride height (mm): + extensio
 float SUSP_LEFT_ZERO;           // Absolute left position at boot = ride height (mm)
 float SUSP_RIGHT_ZERO;          // Absolute right position at boot = ride height (mm)
 uint8_t susp_zero_valid = 0;    // 1 once the ride height zero was captured
-uint16_t adcSt_Angle;
 uint16_t ADC_VALUE[3];  // DMA target: [0] PA7 steering, [1] PB0 susp1, [2] PB1 susp2
 
 // Digital inputs
@@ -77,6 +76,24 @@ uint8_t ignition, r2d;  // PC9, PA8
 uint16_t adc_buffers[3][ADC_BUFFER_SIZE];
 uint8_t adc_buffer_index = 0;
 uint16_t adc_filtered[3];
+
+// Steering sensor: Vishay 981HE0B4WA1F16, 360 deg continuous, analog CW, 10..90 % of 5 V
+// (0.5..4.5 V), behind a 2/3 divider. Its output jumps from 90 % back to 10 % once per turn.
+// Calibration lives in acq4.steering (centre_deg, stop_min/max_deg, margin_deg, set_centre), see Acq4_Debug.
+// Defaults measured on the car (sensor_deg): wheels straight 177.6, stops at 50 and 300.
+#define STEERING_CENTRE_DEFAULT_DEG    177.6f
+#define STEERING_STOP_MIN_DEFAULT_DEG  50.0f
+#define STEERING_STOP_MAX_DEFAULT_DEG  300.0f
+#define STEERING_MARGIN_DEFAULT_DEG    10.0f   // allowed past each stop before the hard cap
+#define STEERING_MAX_STEP_DEG  90.0f    // max change in one 50 ms sample (1800 deg/s, no driver does that)
+#define STEERING_MAX_REJECTS   3        // a jump that persists this many samples is real: accept it
+
+typedef enum {
+	STEERING_OK = 0,
+	STEERING_CAPPED,    // past a stop + margin (or turned over): held at that limit until it comes back
+	STEERING_JUMP,      // impossible jump (glitch while the sensor output jumps): last good value held
+	STEERING_FAULT      // sensor output in its diagnostic area (wire open/short, no supply): last good value held
+} SteeringState;
 
 // CAN
 CAN_TxHeaderTypeDef TxHeader;
@@ -102,9 +119,31 @@ typedef struct {
 		float volts[3];         // filtered value at the MCU pin (V)
 	} adc;
 
+	// Steering. The first 5 fields are calibration: write them in Live Expressions, the firmware
+	// reads them and never overwrites them (RAM only: copy final values into the
+	// STEERING_*_DEFAULT_DEG defines, or they are back to the defaults after a reset).
+	// All of them are raw sensor angles (sensor_deg, 0..360).
+	// Centre: wheels straight, write 1 in set_centre. Stops: full lock each side, read sensor_deg.
 	struct {
-		float steering_deg;
-		float susp_left_mm;     // travel from ride height: + extension, - compression
+		float centre_deg;       // sensor_deg with the wheels straight
+		float stop_min_deg;     // sensor_deg at full lock on the low side
+		float stop_max_deg;     // sensor_deg at full lock on the high side
+		float margin_deg;       // allowed past each stop before the hard cap
+		uint8_t set_centre;     // write 1: centre_deg = sensor_deg now (clears itself)
+
+		float angle_deg;        // output sent on CAN (ST_ANGLE): + = sensor CW
+		float cap_min_deg;      // hard cap from the centre: stop_min - margin - centre
+		float cap_max_deg;      // hard cap from the centre: stop_max + margin - centre
+		float sensor_deg;       // raw sensor angle 0..360 (0.5 V = 0, 4.5 V = 360)
+		float sample_deg;       // latest sample from the centre before cap/hold/average
+		SteeringState state;
+		uint32_t capped_count;  // samples held at the limit
+		uint32_t jump_count;    // samples rejected as an impossible jump
+		uint32_t fault_count;   // samples with the sensor output in its diagnostic area
+	} steering;
+
+	struct {
+		float susp_left_mm;   // travel from ride height: + extension, - compression
 		float susp_right_mm;
 		float susp_left_zero_mm;  // absolute position captured at boot
 		float susp_right_zero_mm;
@@ -133,7 +172,14 @@ typedef struct {
 	} can;
 } Acq4_Debug;
 
-Acq4_Debug acq4;
+Acq4_Debug acq4 = {
+	.steering = {
+		.centre_deg = STEERING_CENTRE_DEFAULT_DEG,
+		.stop_min_deg = STEERING_STOP_MIN_DEFAULT_DEG,
+		.stop_max_deg = STEERING_STOP_MAX_DEFAULT_DEG,
+		.margin_deg = STEERING_MARGIN_DEFAULT_DEG,
+	},
+};
 
 // Tasks Prototypes
 void execute_immediate_tasks(void);
@@ -309,9 +355,6 @@ void execute_immediate_tasks() {
 void execute_10ms_tasks() {
 	HAL_IWDG_Refresh(&hiwdg);
 
-	// Latest filtered ADC samples
-	adcSt_Angle = adc_filtered[0];
-
 	// Digital inputs
 	ignition = HAL_GPIO_ReadPin(IGN_GPIO_Port, IGN_Pin);
 	r2d = HAL_GPIO_ReadPin(R2D_GPIO_Port, R2D_Pin);
@@ -327,7 +370,9 @@ void execute_10ms_tasks() {
 
 void execute_50ms_tasks() {
 	ADC_UpdateMovingAverage();
-	ST_ANGLE = MeasureSteeringAngle(adcSt_Angle);
+	// Steering is filtered after the conversion (as an angle), not as raw counts: averaging counts
+	// across the sensor's 90 % -> 10 % jump would give a meaningless angle in between
+	ST_ANGLE = MeasureSteeringAngle(ADC_VALUE[0]);
 
 	// Ride height zero: wherever the suspension sits at boot becomes 0 mm. Captured the first
 	// time the moving average is full (index wraps back to 0, ~0.5 s after boot); until then send 0.
@@ -446,7 +491,7 @@ void Acq4_DebugUpdate(void) {
 		acq4.adc.volts[i] = adc_filtered[i] * 3.3f / 4095.0f;
 	}
 
-	acq4.sensors.steering_deg = ST_ANGLE;
+	acq4.steering.angle_deg = ST_ANGLE;
 	acq4.sensors.susp_left_mm = SUSP1;
 	acq4.sensors.susp_right_mm = SUSP2;
 	acq4.sensors.susp_left_zero_mm = SUSP_LEFT_ZERO;
@@ -502,26 +547,91 @@ float MeasureSuspensionPosition(uint16_t bits) {
 	return SUSPENSION_POSITION;
 }
 
-// Converts ADC counts to steering angle (deg) - 0.5..4.5 V sensor behind a 2/3 divider
+// Converts one ADC sample to steering angle (deg from the centre, + = sensor CW) and returns the
+// moving average of the last ADC_BUFFER_SIZE samples. Call every 50 ms.
+// The angle is taken from acq4.steering.centre_deg and wrapped to +-180 deg. With the sensor mounted
+// so the centre reads ~180 deg, its once-per-turn jump (4.5 V -> 0.5 V) sits at +-180 deg, beyond the
+// stops, so the output is continuous over the whole steering range.
 float MeasureSteeringAngle(uint16_t bits) {
-	const float ADC_MAX = 4095.0f;
-	const float MCU_VREF = 3.3f;
-	const float SENSOR_VREF_Max = 4.5f;
-	const float SENSOR_VREF_Min = 0.5f;
-	const float Resolution = 180.0f;
-	const float OFFSET = -73.8f;
+	static float samples[ADC_BUFFER_SIZE];
+	static uint8_t index = 0;
+	static float last = 0.0f;       // last accepted sample (deg)
+	static uint8_t rejects = 0;     // consecutive samples rejected as a jump
 
-	// Sensor range as seen by the MCU (after the 2/3 divider)
-	float max_v = SENSOR_VREF_Max * (2.0f / 3.0f);
-	float min_v = SENSOR_VREF_Min * (2.0f / 3.0f);
-	float inclination = 360.0f / (max_v - min_v);
+	float v_sensor = bits * (3.3f / 4095.0f) * 1.5f;                 // MCU pin -> sensor output (undo 2/3 divider)
+	acq4.steering.sensor_deg = (v_sensor - 0.5f) * (360.0f / 4.0f);  // 0.5 V = 0 deg, 4.5 V = 360 deg
 
-	float V_STA = (bits * MCU_VREF) / ADC_MAX;
-	float ST_Angle = inclination * V_STA - 45.0f - Resolution;
+	// Live Expressions: write 1 in set_centre with the wheels straight to make this the centre.
+	// The filter restarts from 0 so the new centre does not look like a jump.
+	if (acq4.steering.set_centre) {
+		acq4.steering.set_centre = 0;
+		acq4.steering.centre_deg = acq4.steering.sensor_deg;
+		last = 0.0f;
+		rejects = 0;
+		for (int i = 0; i < ADC_BUFFER_SIZE; i++) {
+			samples[i] = 0.0f;
+		}
+	}
 
-	// Mechanical zero calibration
-	ST_Angle = ST_Angle + OFFSET;
-	return ST_Angle;
+	// Hard cap from the centre: each stop plus the margin, never past the +-180 wrap
+	float cap_min = acq4.steering.stop_min_deg - acq4.steering.margin_deg - acq4.steering.centre_deg;
+	float cap_max = acq4.steering.stop_max_deg + acq4.steering.margin_deg - acq4.steering.centre_deg;
+	if (cap_min < -180.0f) {
+		cap_min = -180.0f;
+	}
+	if (cap_max > 180.0f) {
+		cap_max = 180.0f;
+	}
+	acq4.steering.cap_min_deg = cap_min;
+	acq4.steering.cap_max_deg = cap_max;
+
+	float angle = acq4.steering.sensor_deg - acq4.steering.centre_deg;
+	while (angle > 180.0f) {
+		angle -= 360.0f;
+	}
+	while (angle <= -180.0f) {
+		angle += 360.0f;
+	}
+	acq4.steering.sample_deg = angle;
+
+	float step = angle - last;
+
+	if ((v_sensor < 0.25f) || (v_sensor > 4.8f)) {
+		// Diagnostic area (outside 10..90 % with margin for the 5 V tolerance): hold the last good value
+		acq4.steering.state = STEERING_FAULT;
+		acq4.steering.fault_count++;
+		angle = last;
+	} else if ((step > 360.0f - STEERING_MAX_STEP_DEG) || (step < -(360.0f - STEERING_MAX_STEP_DEG))) {
+		// Short way across +-180: it turned over. Hard cap on the side it was until it comes back.
+		acq4.steering.state = STEERING_CAPPED;
+		acq4.steering.capped_count++;
+		angle = (last >= 0.0f) ? cap_max : cap_min;
+	} else if ((angle > cap_max) || (angle < cap_min)) {
+		// Past a stop + margin: hard cap
+		acq4.steering.state = STEERING_CAPPED;
+		acq4.steering.capped_count++;
+		angle = (angle > cap_max) ? cap_max : cap_min;
+	} else if (((step > STEERING_MAX_STEP_DEG) || (step < -STEERING_MAX_STEP_DEG)) &&
+	           (rejects < STEERING_MAX_REJECTS)) {
+		// Too fast to be the driver: glitch while the sensor output jumps 90 % -> 10 %
+		rejects++;
+		acq4.steering.state = STEERING_JUMP;
+		acq4.steering.jump_count++;
+		angle = last;
+	} else {
+		rejects = 0;
+		acq4.steering.state = STEERING_OK;
+		last = angle;
+	}
+
+	samples[index] = angle;
+	index = (index + 1) % ADC_BUFFER_SIZE;
+
+	float sum = 0.0f;
+	for (int i = 0; i < ADC_BUFFER_SIZE; i++) {
+		sum += samples[i];
+	}
+	return sum / ADC_BUFFER_SIZE;
 }
 /* USER CODE END 4 */
 
